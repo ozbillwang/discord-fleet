@@ -1,0 +1,36 @@
+[Unit]
+Description=bx-llm-gw: model-allowlist proxy to model gateway for the BuilderXAI fleet
+Documentation=file:///usr/local/lib/bx-llm-gw/bx-llm-gw.py
+After=bx-egress.service network-online.target
+Requires=bx-egress.service
+Wants=network-online.target
+Before=hermes-gw@.service
+
+[Service]
+User=bxgw
+Group=bxgw
+EnvironmentFile=/etc/builderxai/secrets/llm-upstream.env
+EnvironmentFile=/etc/builderxai/secrets/bxgw-clients.env
+Environment=BXGW_LISTEN=127.0.0.1:18080
+Environment=BXGW_RPM=20
+Environment=BXGW_MAX_TOKENS=8192
+# image route: per-client image model allowlist + daily quota (alias=upstream|...;client:...)
+Environment="BXGW_IMAGE_MODELS=guild:gpt-image-2=gpt-image-2|gpt-image-2.5=gpt-image-2.5|grok-imagine-image-2.0=grok-imagine-image-2.0;builderxai:gpt-image-2=gpt-image-2|grok-imagine-image-2.0=grok-imagine-image-2.0|gpt-image-2.5=gpt-image-2.5"
+Environment=BXGW_IMAGE_MAX_N=2
+Environment=BXGW_IMAGE_DAILY=60
+ExecStart=/usr/bin/python3 /usr/local/lib/bx-llm-gw/bx-llm-gw.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

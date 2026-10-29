@@ -1,0 +1,14 @@
+# /data/bridge.yaml — one per Bot User container
+agents_root: /data/agents
+sessions_root: /data/sessions
+admin_ids: ["<owner discord id>"]   # owner (reserved; grants no extra power today)
+turn_timeout: 240
+idle_session_seconds: 1800
+max_live_sessions: 6
+per_user_per_min: 6
+thread_auto_archive_minutes: 1440
+bindings:
+  # Guild Manager requests these (【绑定请求】); the runtime edits this file → auto hot-reload.
+  - channel_id: "000000000000000000"
+    agent: general
+    name: "#general"

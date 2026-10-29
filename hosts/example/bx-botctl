@@ -1,0 +1,367 @@
+#!/usr/bin/python3 -I
+"""bx-botctl: the ONLY way Guild Manager (bxadmin) controls Bot User runtimes. Runs as root via sudo.
+
+Guild edits staging config it owns (/srv/builderxai/bots/<bot>/); this tool validates it and
+applies it into the Bot User's data dir (owned by bx), builds the bridge image from the
+the operator agent-deployed source (/srv/builderxai/bridge), and starts/stops the bx-bridge@<bot> unit.
+Policy enforced here (not by prompt): protected admin channels can't be bound, the model must go
+through the H8 proxy, no symlinks or special files are copied, and no secrets are ever printed.
+"""
+import json, os, pwd, re, shutil, stat, subprocess, sys, tempfile, time
+
+SRC = "/srv/builderxai/bridge"              # deployed by the operator agent from the repo (root-owned)
+STAGE = "/srv/builderxai/bots"              # Guild-owned staging: <bot>/{bridge.yaml,agents/,omp-agent/}
+LIVE = "/home/bx/bridges"                   # bx-owned data dirs, mounted at /data
+SECRETS = "/etc/builderxai/secrets"
+IMGENV = "/etc/builderxai/bridge.env"       # BRIDGE_IMAGE=bx-bridge:<rev>
+PROTECTED = set(filter(None, os.environ.get("BX_PROTECTED_IDS", "").split(",")))   # Admin category, #admin
+PROXY_URL = "http://10.0.2.2:18080/v1"
+BOT_RE = re.compile(r"[a-z][a-z0-9-]{1,30}")
+AGENT_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,40}")
+MAX_FILE = 256 * 1024
+MAX_FILES = 500
+
+BX = pwd.getpwnam("bx")
+
+
+def die(msg):
+    print("refused:", msg)
+    sys.exit(2)
+
+
+def run(cmd, check=True, **kw):
+    r = subprocess.run(cmd, **kw)
+    if check and r.returncode != 0:
+        sys.exit(r.returncode)
+    return r
+
+
+def asbx(cmd, extra_env=None, **kw):
+    env = ["env", f"XDG_RUNTIME_DIR=/run/user/{BX.pw_uid}", f"DOCKER_HOST=unix:///run/user/{BX.pw_uid}/docker.sock",
+           "PATH=/home/bx/bin:/usr/bin:/bin", "HOME=/home/bx"]
+    pe = []
+    if extra_env:   # secrets travel via environment (sudo --preserve-env), never argv (ps-visible)
+        kw["env"] = dict(os.environ, **extra_env)
+        pe = ["--preserve-env=" + ",".join(extra_env)]
+    return run(["sudo", "-u", "bx", "-H", *pe, *env, *cmd], **kw)
+
+
+def bot_arg(a):
+    if not a or not BOT_RE.fullmatch(a):
+        die(f"bad bot name {a!r}")
+    return a
+
+
+def image():
+    try:
+        for line in open(IMGENV):
+            if line.startswith("BRIDGE_IMAGE="):
+                return line.split("=", 1)[1].strip()
+    except FileNotFoundError:
+        pass
+    return None
+
+
+# ---------- safe copy (no symlinks, no special files, race-safe via dir fds)
+def safe_copy_tree(src_root, dst_root):
+    n = 0
+    os.makedirs(dst_root, exist_ok=True)
+    for dirpath, dirnames, filenames, dirfd in os.fwalk(src_root, follow_symlinks=False):
+        rel = os.path.relpath(dirpath, src_root)
+        for d in dirnames:
+            st = os.stat(d, dir_fd=dirfd, follow_symlinks=False)
+            if not stat.S_ISDIR(st.st_mode):
+                die(f"not a plain directory: {os.path.join(rel, d)}")
+            os.makedirs(os.path.join(dst_root, rel, d), exist_ok=True)
+        for f in filenames:
+            n += 1
+            if n > MAX_FILES:
+                die("too many files")
+            try:
+                fd = os.open(f, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dirfd)
+            except OSError:
+                die(f"symlink or unreadable: {os.path.join(rel, f)}")
+            with os.fdopen(fd, "rb") as fh:
+                st = os.fstat(fh.fileno())
+                if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+                    die(f"not a plain file: {os.path.join(rel, f)}")
+                data = fh.read(MAX_FILE + 1)
+            if len(data) > MAX_FILE:
+                die(f"file too large: {os.path.join(rel, f)}")
+            with open(os.path.join(dst_root, rel, f), "wb") as out:
+                out.write(data)
+
+
+def validate(tmp):
+    import yaml
+    try:
+        cfg = yaml.safe_load(open(os.path.join(tmp, "bridge.yaml"))) or {}
+    except Exception as e:
+        die(f"bridge.yaml: {e}")
+    cfg["agents_root"] = "/data/agents"          # forced, not configurable by staging
+    cfg["sessions_root"] = "/data/sessions"
+    seen = set()
+    for b in cfg.get("bindings") or []:
+        cid, agent = str(b.get("channel_id", "")), str(b.get("agent", ""))
+        if not cid.isdigit():
+            die(f"bad channel_id {cid!r}")
+        if cid in PROTECTED:
+            die(f"channel {cid} is admin space and can never be bound")
+        if cid in seen:
+            die(f"channel {cid} bound twice")
+        seen.add(cid)
+        if not AGENT_RE.fullmatch(agent):
+            die(f"bad agent name {agent!r}")
+        if not os.path.isfile(os.path.join(tmp, "agents", agent, ".omp", "SYSTEM.md")):
+            die(f"agent {agent}: agents/{agent}/.omp/SYSTEM.md missing")
+    with open(os.path.join(tmp, "bridge.yaml"), "w") as f:
+        yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
+    mpath = os.path.join(tmp, "omp-agent", "models.yml")
+    try:
+        models = yaml.safe_load(open(mpath)) or {}
+    except Exception as e:
+        die(f"omp-agent/models.yml: {e}")
+    provs = (models.get("providers") or {})
+    if not provs:
+        die("models.yml has no providers")
+    for name, p in provs.items():
+        if str(p.get("baseUrl", "")).rstrip("/") != PROXY_URL:
+            die(f"provider {name}: baseUrl must be {PROXY_URL} (H8 proxy)")
+        if p.get("apiKey") != "CLIAPI_API_KEY":
+            die(f"provider {name}: apiKey must be the env name CLIAPI_API_KEY")
+    return cfg
+
+
+def chown_tree(path, uid, gid):
+    for dirpath, dirnames, filenames in os.walk(path):
+        os.lchown(dirpath, uid, gid)
+        for f in filenames:
+            os.lchown(os.path.join(dirpath, f), uid, gid)
+
+
+# ---------- commands
+def cmd_status(args):
+    out = subprocess.run(["systemctl", "list-units", "--all", "--no-legend", "--plain", "bx-bridge@*", "hermes-bot@*"],
+                         capture_output=True, text=True).stdout
+    print("units:\n" + (out.strip() or "  (none)"))
+    print("image (configured):", image() or "(none - run build)")
+    try:
+        print("bridge source revision:", open(os.path.join(SRC, "REVISION")).read().strip())
+    except FileNotFoundError:
+        print("bridge source: missing")
+    print("containers:")
+    asbx(["docker", "ps", "--format", "  {{.Names}}  {{.Image}}  {{.Status}}"], check=False)
+    print("bots with staging:", " ".join(sorted(os.listdir(STAGE))) if os.path.isdir(STAGE) else "-")
+    print("bots with live data:", " ".join(sorted(os.listdir(LIVE))) if os.path.isdir(LIVE) else "-")
+
+
+def cmd_build(args):
+    rev = open(os.path.join(SRC, "REVISION")).read().strip()
+    if not re.fullmatch(r"[0-9a-f]{7,40}", rev):
+        die("bad REVISION")
+    tag = f"bx-bridge:{rev}"
+    asbx(["docker", "build", "-q", "-t", tag, SRC])
+    with open(IMGENV, "w") as f:
+        f.write(f"BRIDGE_IMAGE={tag}\n")
+    os.chmod(IMGENV, 0o644)
+    print("built and selected", tag, "(restart running bridges to use it)")
+
+
+def _test_dir(name):
+    d = os.path.join(BX.pw_dir, ".cache", "bridge-test", name)
+    if os.path.isdir(d):
+        shutil.rmtree(d)
+    os.makedirs(d)
+    return d
+
+
+def cmd_test(args):
+    bot = bot_arg(args[0] if args else "builderxai")
+    img = image() or die("no image; run build")
+    # 1. routing (no network)
+    d = _test_dir("routing")
+    chown_tree(os.path.dirname(d), BX.pw_uid, BX.pw_gid)
+    print("== routing test")
+    asbx(["docker", "run", "--rm", "--network", "none", "--user", "0:0", "--cap-drop", "ALL",
+          "--security-opt", "no-new-privileges", "-v", f"{d}:/data", "-v", f"{SRC}/tests:/t:ro",
+          "--entrypoint", "python3", img, "/t/routing_test.py"], check=False)
+    # 2. real omp sessions through the H8 proxy with this bot's model key
+    d = _test_dir("omp")
+    os.makedirs(os.path.join(d, "omp-agent"))
+    shutil.copy(os.path.join(SRC, "omp-agent", "models.yml"), os.path.join(d, "omp-agent"))
+    shutil.copy(os.path.join(SRC, "omp-agent", "config.yml"), os.path.join(d, "omp-agent"))
+    for name, pos in (("alpha", "本地模型与推理优化的讨论"), ("beta", "语音合成 TTS 与语音克隆的讨论")):
+        shutil.copytree(os.path.join(SRC, "agent-template"), os.path.join(d, "agents", name))
+        p = os.path.join(d, "agents", name, ".omp", "SYSTEM.md")
+        s = open(p).read().replace("{{TOPIC_TITLE}}", name).replace("{{CHANNEL}}", name + "-test").replace("{{POSITIONING}}", pos)
+        open(p, "w").write(s)
+    chown_tree(os.path.dirname(d), BX.pw_uid, BX.pw_gid)
+    key = None
+    for line in open(os.path.join(SECRETS, f"llm-{bot}.env")):
+        if line.startswith("CLIAPI_API_KEY="):
+            key = line.split("=", 1)[1].strip()
+    print("== omp session test (model via proxy)")
+    if not key:
+        die(f"no model key in llm-{bot}.env")
+    asbx(["docker", "run", "--rm", "--user", "0:0", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+          "-e", "CLIAPI_API_KEY", "-e", "HOME=/data", "-v", f"{d}:/data", "-v", f"{SRC}/tests:/t:ro",
+          "--entrypoint", "python3", img, "/t/omp_session_test.py"], extra_env={"CLIAPI_API_KEY": key}, check=False)
+    # 3. image_generate end to end (fake image gateway inside the test: no image quota spent; chat model via proxy)
+    if os.path.isfile(os.path.join(SRC, "tests", "image_test.py")):
+        d = _test_dir("image")
+        os.makedirs(os.path.join(d, "omp-agent"))
+        for f in ("models.yml", "config.yml"):
+            shutil.copy(os.path.join(SRC, "omp-agent", f), os.path.join(d, "omp-agent"))
+        shutil.copytree(os.path.join(SRC, "agent-template"), os.path.join(d, "agents", "alpha"))
+        p = os.path.join(d, "agents", "alpha", ".omp", "SYSTEM.md")
+        s = open(p).read().replace("{{TOPIC_TITLE}}", "alpha").replace("{{CHANNEL}}", "alpha-test").replace("{{POSITIONING}}", "AI 社区活动与设计")
+        open(p, "w").write(s)
+        chown_tree(os.path.dirname(d), BX.pw_uid, BX.pw_gid)
+        for t in ("image_test.py", "image_edit_test.py", "web_budget_test.py"):
+            if not os.path.isfile(os.path.join(SRC, "tests", t)):
+                continue
+            print(f"== {t} (fake image/web backends, model via proxy)")
+            asbx(["docker", "run", "--rm", "--user", "0:0", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+                  "-e", "CLIAPI_API_KEY", "-e", "HOME=/data", "-v", f"{d}:/data", "-v", f"{SRC}/tests:/t:ro",
+                  "--entrypoint", "python3", img, f"/t/{t}"], extra_env={"CLIAPI_API_KEY": key}, check=False)
+
+
+def cmd_apply(args):
+    bot = bot_arg(args[0] if args else "")
+    stage = os.path.join(STAGE, bot)
+    if not os.path.isdir(stage):
+        die(f"no staging dir {stage}")
+    tmp = tempfile.mkdtemp(prefix=f"botctl-{bot}-")
+    try:
+        safe_copy_tree(stage, tmp)
+        cfg = validate(tmp)
+        live = os.path.join(LIVE, bot)
+        os.makedirs(os.path.join(live, "sessions"), exist_ok=True)
+        os.makedirs(os.path.join(live, "home"), exist_ok=True)
+        # replace config parts atomically-ish; sessions and home are kept
+        for part in ("agents", "omp-agent"):
+            src, dst = os.path.join(tmp, part), os.path.join(live, part)
+            if not os.path.isdir(src):
+                die(f"staging is missing {part}/")
+            if part == "omp-agent" and os.path.isdir(dst):
+                # keep omp's runtime dbs; only replace the two config files
+                for f in ("models.yml", "config.yml"):
+                    if os.path.isfile(os.path.join(src, f)):
+                        shutil.copy(os.path.join(src, f), os.path.join(dst, f))
+                continue
+            old = dst + ".old"
+            if os.path.exists(old):
+                shutil.rmtree(old)
+            if os.path.exists(dst):
+                os.rename(dst, old)
+            shutil.copytree(src, dst)
+            if os.path.exists(old):
+                shutil.rmtree(old)
+        shutil.copy(os.path.join(tmp, "bridge.yaml"), os.path.join(live, "bridge.yaml.new"))
+        os.replace(os.path.join(live, "bridge.yaml.new"), os.path.join(live, "bridge.yaml"))
+        os.chmod(live, 0o700)
+        chown_tree(live, BX.pw_uid, BX.pw_gid)
+        os.makedirs(LIVE, exist_ok=True)
+        os.lchown(LIVE, BX.pw_uid, BX.pw_gid)
+        os.chmod(LIVE, 0o700)
+        b = cfg.get("bindings") or []
+        print(f"applied {bot}: {len(b)} binding(s): " + ", ".join(f"{x['channel_id']}->{x['agent']}" for x in b))
+        print("bindings hot-reload in <=30s if the bridge is running; model/config.yml changes need: restart", bot)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _unit(action, bot):
+    bot = bot_arg(bot)
+    if action in ("start", "restart", "enable"):
+        if not os.path.isfile(os.path.join(SECRETS, f"{bot}.env")) or os.path.getsize(os.path.join(SECRETS, f"{bot}.env")) == 0:
+            die(f"no Discord token for {bot} (ask the owner/operator to create the Bot User credential)")
+        if not os.path.isfile(os.path.join(LIVE, bot, "bridge.yaml")):
+            die(f"{bot} has no applied config (run: apply {bot})")
+        if not image():
+            die("no bridge image (run: build)")
+    args = ["systemctl", action, f"bx-bridge@{bot}"]
+    if action == "enable":
+        args = ["systemctl", "enable", "--now", f"bx-bridge@{bot}"]
+    if action == "disable":
+        args = ["systemctl", "disable", "--now", f"bx-bridge@{bot}"]
+    run(args)
+    time.sleep(2)
+    print(f"bx-bridge@{bot}:", subprocess.run(["systemctl", "is-active", f"bx-bridge@{bot}"], capture_output=True, text=True).stdout.strip())
+
+
+def cmd_legacy_stop(args):
+    bot = bot_arg(args[0] if args else "")
+    run(["systemctl", "disable", "--now", f"hermes-bot@{bot}"], check=False)
+    print(f"hermes-bot@{bot}:", subprocess.run(["systemctl", "is-active", f"hermes-bot@{bot}"], capture_output=True, text=True).stdout.strip())
+
+
+def cmd_legacy_start(args):
+    """Rollback: stop the bridge, bring the old Hermes container back."""
+    bot = bot_arg(args[0] if args else "")
+    run(["systemctl", "disable", "--now", f"bx-bridge@{bot}"], check=False)
+    run(["systemctl", "enable", "--now", f"hermes-bot@{bot}"], check=False)
+    time.sleep(2)
+    for u in (f"bx-bridge@{bot}", f"hermes-bot@{bot}"):
+        print(f"{u}:", subprocess.run(["systemctl", "is-active", u], capture_output=True, text=True).stdout.strip())
+
+
+def cmd_logs(args):
+    bot = bot_arg(args[0] if args else "")
+    n = args[1] if len(args) > 1 else "100"
+    if not n.isdigit() or int(n) > 2000:
+        die("lines must be 1..2000")
+    asbx(["docker", "logs", "--tail", n, f"bridge-{bot}"], check=False)
+
+
+CMDS = {
+    "status": cmd_status, "build": cmd_build, "test": cmd_test, "apply": cmd_apply,
+    "start": lambda a: _unit("start", a[0] if a else ""), "stop": lambda a: _unit("stop", a[0] if a else ""),
+    "restart": lambda a: _unit("restart", a[0] if a else ""), "enable": lambda a: _unit("enable", a[0] if a else ""),
+    "disable": lambda a: _unit("disable", a[0] if a else ""), "legacy-stop": cmd_legacy_stop, "legacy-start": cmd_legacy_start, "logs": cmd_logs,
+}
+
+ALLOWED_PEERS = {0, pwd.getpwnam("bxadmin").pw_uid}
+EXIT_MARK = "\x00BX-BOTCTL-EXIT "
+
+
+def dispatch(argv):
+    if not argv or argv[0] not in CMDS:
+        print("usage: botctl " + "|".join(CMDS) + " [bot] ...")
+        return 1
+    try:
+        CMDS[argv[0]](argv[1:])
+        return 0
+    except SystemExit as e:
+        return e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+
+
+def serve():
+    """Socket-activated (bx-botctl@.service, Accept=yes): one request per connection.
+    Protocol: client sends one JSON array line; we stream output, then EXIT_MARK<code>."""
+    import socket, struct, syslog
+    sock = socket.socket(fileno=0)
+    pid, uid, gid = struct.unpack("3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+    sys.stdout.reconfigure(line_buffering=True)
+    if uid not in ALLOWED_PEERS:
+        print(f"refused: peer uid {uid} not allowed")
+        print(EXIT_MARK + "2"); return
+    line = sock.makefile("rb").readline(4096)
+    try:
+        argv = json.loads(line)
+        assert isinstance(argv, list) and 0 < len(argv) <= 8 and all(isinstance(a, str) and len(a) < 200 for a in argv)
+    except Exception:
+        print("refused: bad request"); print(EXIT_MARK + "2"); return
+    syslog.syslog(syslog.LOG_NOTICE, f"bx-botctl: peer uid={uid} pid={pid} argv={argv!r}")
+    code = dispatch(argv)
+    sys.stdout.flush()
+    print(EXIT_MARK + str(code))
+
+
+if __name__ == "__main__":
+    if os.geteuid() != 0:
+        sys.exit("this is the root side; use /usr/local/bin/botctl <command>")
+    if sys.argv[1:2] == ["--serve"]:
+        serve()
+    else:
+        sys.exit(dispatch(sys.argv[1:]))

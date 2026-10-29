@@ -1,0 +1,4 @@
+# per-agent omp settings (project scope, discovered via cwd)
+compaction:
+  strategy: shake
+autoContinue: false

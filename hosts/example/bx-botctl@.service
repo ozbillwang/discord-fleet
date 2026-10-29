@@ -1,0 +1,10 @@
+[Unit]
+Description=bx-botctl request (root; validates and applies Guild's Bot User changes)
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/bx-botctl --serve
+StandardInput=socket
+StandardOutput=socket
+StandardError=socket
+RuntimeMaxSec=1800

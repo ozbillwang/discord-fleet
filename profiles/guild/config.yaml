@@ -1,0 +1,23 @@
+# Hermes profile: guild (admin bot). Target ~bxadmin/.hermes/profiles/guild/config.yaml
+# Secrets via systemd EnvironmentFile (llm-guild.env, guild.env, github.env, email.env).
+model:
+  default: claude-opus-5-5        # strong model; Guild obeys the owner only. Alt: claude-fable-5-1
+  provider: custom
+  base_url: https://llm.example.com/v1   # direct, dedicated key (llm-guild.env)
+  api_key: ${CLIAPI_API_KEY}
+
+terminal:
+  backend: local
+
+discord:
+  require_mention: false
+  allowed_channels: '<#admin channel id>'
+  free_response_channels: '<#admin channel id>'
+  auto_thread: true
+  reactions: true
+  allow_admin_from: ['<owner discord id>']
+  group_allow_admin_from: ['<owner discord id>']
+# DISCORD_ALLOWED_USERS=<owner discord id> is set in the gateway drop-in (non-secret).
+
+approvals:
+  mode: manual

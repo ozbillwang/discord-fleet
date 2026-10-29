@@ -1,0 +1,32 @@
+[Unit]
+Description=BuilderXAI Bot User %i: Discord Bridge + omp agents (rootless container, user bx)
+After=bx-egress.service bx-llm-gw.service network-online.target user@1002.service
+Requires=bx-egress.service user@1002.service
+Wants=bx-llm-gw.service
+# only one process may hold a Bot User token
+Conflicts=hermes-bot@%i.service
+
+[Service]
+User=bx
+Group=bx
+EnvironmentFile=/etc/builderxai/bridge.env
+EnvironmentFile=/etc/builderxai/secrets/llm-%i.env
+EnvironmentFile=/etc/builderxai/secrets/%i.env
+# optional web tools token (WEB_CLIENT_TOKEN); bridge loads the 3 web tools only when it is set
+EnvironmentFile=-/etc/builderxai/secrets/web-bot.env
+Environment=XDG_RUNTIME_DIR=/run/user/1002
+Environment=DOCKER_HOST=unix:///run/user/1002/docker.sock
+ExecStartPre=-/usr/bin/docker rm -f bridge-%i
+ExecStart=/usr/bin/docker run --rm --name bridge-%i \
+  --user 0:0 --cap-drop ALL --security-opt no-new-privileges \
+  --memory 2g --pids-limit 512 --cpus 1 \
+  --dns 1.1.1.1 --dns 8.8.8.8 \
+  -e DISCORD_BOT_TOKEN -e CLIAPI_API_KEY -e WEB_CLIENT_TOKEN -e HOME=/data/home \
+  -v /home/bx/bridges/%i:/data \
+  ${BRIDGE_IMAGE}
+ExecStop=/usr/bin/docker stop -t 20 bridge-%i
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

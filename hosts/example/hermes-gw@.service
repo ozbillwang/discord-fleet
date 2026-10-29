@@ -1,0 +1,22 @@
+[Unit]
+Description=Hermes gateway (BuilderXAI fleet) bot %i
+Documentation=discord-fleet spec/host.md H7
+After=bx-egress.service network-online.target
+Requires=bx-egress.service
+Wants=network-online.target
+
+[Service]
+# User=, EnvironmentFile=, Environment= and ExecStart= come from the per-bot drop-in:
+#   /etc/systemd/system/hermes-gw@<bot>.service.d/bot.conf
+Restart=on-failure
+RestartSec=15
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target

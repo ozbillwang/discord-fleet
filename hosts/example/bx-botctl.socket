@@ -1,0 +1,13 @@
+[Unit]
+Description=bx-botctl socket (Guild Manager -> Bot User runtime control; bxadmin group only)
+
+[Socket]
+ListenStream=/run/bx-botctl.sock
+SocketUser=root
+SocketGroup=bxadmin
+SocketMode=0660
+Accept=yes
+MaxConnections=4
+
+[Install]
+WantedBy=sockets.target

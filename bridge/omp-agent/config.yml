@@ -1,0 +1,7 @@
+# /data/omp-agent/config.yml — shared omp settings for all agents of one Bot User
+modelRoles:
+  default: bx/gemini-3.8-flash-high
+  smol: bx/gemini-3.6-flash
+  slow: bx/gemini-3.8-flash-high
+  plan: bx/gemini-3.8-flash-high
+  commit: bx/gemini-3.6-flash

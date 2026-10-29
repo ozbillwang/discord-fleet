@@ -1,0 +1,38 @@
+#!/usr/bin/python3 -I
+"""botctl: Guild Manager's client for the root bx-botctl service (unix socket, bxadmin group only).
+Usage: botctl <status|build|test|apply|enable|disable|start|stop|restart|legacy-stop|logs> [bot] ...
+Works under NoNewPrivileges (no sudo involved). Exit code = the server's exit code."""
+import json, socket, sys
+
+SOCK = "/run/bx-botctl.sock"
+MARK = b"\x00BX-BOTCTL-EXIT "
+
+if len(sys.argv) < 2:
+    sys.exit(__doc__.strip())
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+try:
+    s.connect(SOCK)
+except OSError as e:
+    sys.exit(f"botctl: cannot connect to {SOCK}: {e}")
+s.sendall((json.dumps(sys.argv[1:]) + "\n").encode())
+buf, code = b"", 1
+out = sys.stdout.buffer
+while True:
+    chunk = s.recv(65536)
+    if not chunk:
+        break
+    buf += chunk
+    i = buf.find(MARK)
+    if i >= 0:
+        out.write(buf[:i]); out.flush()
+        tail = buf[i + len(MARK):].split(b"\n", 1)[0]
+        code = int(tail) if tail.strip().isdigit() else 1
+        buf = b""
+        break
+    # flush everything except a possible partial marker at the end
+    keep = len(MARK) - 1
+    if len(buf) > keep:
+        out.write(buf[:-keep]); out.flush()
+        buf = buf[-keep:]
+out.write(buf); out.flush()
+sys.exit(code)
