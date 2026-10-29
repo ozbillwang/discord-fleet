@@ -1,0 +1,135 @@
+name: Setup Lambda IAM Role
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION }}
+
+jobs:
+  create-role:
+    name: Create Lambda Execution Role
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Check if role exists
+        id: check-role
+        run: |
+          if aws iam get-role --role-name lambda-execution-role 2>/dev/null; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create IAM Role
+        if: steps.check-role.outputs.exists == 'false'
+        run: |
+          cat > trust-policy.json << 'EOF'
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Principal": {
+                  "Service": "lambda.amazonaws.com"
+                },
+                "Action": "sts:AssumeRole"
+              }
+            ]
+          }
+          EOF
+          
+          aws iam create-role \
+            --role-name lambda-execution-role \
+            --assume-role-policy-document file://trust-policy.json
+          
+          echo "✅ Role created"
+
+      - name: Attach DynamoDB policy
+        run: |
+          cat > dynamodb-policy.json << 'EOF'
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "dynamodb:GetItem",
+                  "dynamodb:PutItem",
+                  "dynamodb:Query",
+                  "dynamodb:UpdateItem",
+                  "dynamodb:CreateTable"
+                ],
+                "Resource": "arn:aws:dynamodb:*:*:table/discord-fleet-*"
+              }
+            ]
+          }
+          EOF
+          
+          aws iam put-role-policy \
+            --role-name lambda-execution-role \
+            --policy-name dynamodb-policy \
+            --policy-document file://dynamodb-policy.json
+          
+          echo "✅ DynamoDB policy attached"
+
+      - name: Attach Lambda invoke policy
+        run: |
+          cat > lambda-policy.json << 'EOF'
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "lambda:InvokeFunction"
+                ],
+                "Resource": "arn:aws:lambda:*:*:function:discord-fleet-*"
+              }
+            ]
+          }
+          EOF
+          
+          aws iam put-role-policy \
+            --role-name lambda-execution-role \
+            --policy-name lambda-invoke-policy \
+            --policy-document file://lambda-policy.json
+          
+          echo "✅ Lambda invoke policy attached"
+
+      - name: Attach CloudWatch Logs policy
+        run: |
+          aws iam attach-role-policy \
+            --role-name lambda-execution-role \
+            --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+          
+          echo "✅ CloudWatch Logs policy attached"
+
+      - name: Summary
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/lambda-execution-role"
+          
+          echo ""
+          echo "================================"
+          echo "✅ IAM Role Setup Complete"
+          echo "================================"
+          echo ""
+          echo "Role Name: lambda-execution-role"
+          echo "Role ARN: ${ROLE_ARN}"
+          echo ""
+          echo "Attached Policies:"
+          echo "  ✓ DynamoDB access (create/read/write)"
+          echo "  ✓ Lambda invoke access"
+          echo "  ✓ CloudWatch Logs access"
+          echo ""
+          echo "This role is ready for Lambda functions!"
+          echo ""
+          echo "Next: Push to feature/serverless to deploy Lambda functions"
