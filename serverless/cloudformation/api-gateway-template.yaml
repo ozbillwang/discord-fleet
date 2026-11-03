@@ -74,6 +74,7 @@ Resources:
     Properties:
       FunctionName: !Ref MessageHandlerFunctionName
       Runtime: python3.11
+      Handler: index.lambda_handler
       Role: !Ref LambdaExecutionRoleArn
       Timeout: 60
       MemorySize: 512
@@ -158,6 +159,7 @@ Resources:
     Properties:
       FunctionName: !Ref OmpAgentHandlerFunctionName
       Runtime: python3.11
+      Handler: index.lambda_handler
       Role: !Ref LambdaExecutionRoleArn
       Timeout: 30
       MemorySize: 256
