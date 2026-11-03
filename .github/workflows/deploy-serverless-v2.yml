@@ -1,0 +1,247 @@
+name: Deploy Discord Fleet Serverless (CloudFormation)
+
+on:
+  push:
+    branches:
+      - feature/serverless
+    paths:
+      - 'serverless/**'
+      - '.github/workflows/deploy-serverless-v2.yml'
+  workflow_dispatch:
+
+env:
+  AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION }}
+  PYTHON_VERSION: '3.11'
+  STACK_PREFIX: discord-fleet
+
+jobs:
+  validate:
+    name: Validate Configuration
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Check Python syntax
+        run: |
+          python -m py_compile serverless/lambda/llm_provider.py
+          echo "✅ Python syntax validation passed"
+
+      - name: Validate file structure
+        run: |
+          echo "Checking serverless directory structure..."
+          test -f serverless/00_START_HERE.md || (echo "❌ Missing 00_START_HERE.md" && exit 1)
+          test -d serverless/docs || (echo "❌ Missing docs directory" && exit 1)
+          test -d serverless/lambda || (echo "❌ Missing lambda directory" && exit 1)
+          test -f serverless/lambda/llm_provider.py || (echo "❌ Missing llm_provider.py" && exit 1)
+          test -d serverless/cloudformation || (echo "❌ Missing cloudformation directory" && exit 1)
+          echo "✅ File structure validation passed"
+
+      - name: Validate CloudFormation templates
+        run: |
+          echo "Validating CloudFormation templates..."
+          aws cloudformation validate-template --template-body file://serverless/cloudformation/dynamodb-template.yaml
+          aws cloudformation validate-template --template-body file://serverless/cloudformation/api-gateway-template.yaml
+          echo "✅ CloudFormation templates valid"
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+  build-lambda-layer:
+    name: Build Lambda Layer (Dependencies)
+    runs-on: ubuntu-latest
+    needs: validate
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          mkdir -p lambda_layer/python
+          cd lambda_layer/python
+          
+          # Install required packages
+          pip install \
+            anthropic==0.7.1 \
+            openai==1.3.5 \
+            requests==2.31.0 \
+            boto3==1.28.0 \
+            -t .
+          
+          cd ../..
+          echo "✅ Dependencies installed"
+
+      - name: Create layer zip
+        run: |
+          cd lambda_layer
+          zip -r ../lambda-layer.zip .
+          cd ..
+          ls -lh lambda-layer.zip
+          echo "✅ Lambda layer created"
+
+      - name: Upload layer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lambda-layer
+          path: lambda-layer.zip
+          retention-days: 1
+
+  deploy-infrastructure:
+    name: Deploy Infrastructure (CloudFormation)
+    runs-on: ubuntu-latest
+    needs: [validate, build-lambda-layer]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Verify AWS credentials
+        run: |
+          echo "Verifying AWS credentials..."
+          aws sts get-caller-identity
+          echo "✅ AWS credentials verified"
+
+      - name: Download Lambda layer artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: lambda-layer
+
+      - name: Upload Lambda layer to S3
+        run: |
+          BUCKET_NAME="discord-fleet-artifacts-$(aws sts get-caller-identity --query Account --output text)"
+          
+          # Create bucket if it doesn't exist
+          aws s3 ls "s3://${BUCKET_NAME}" || aws s3 mb "s3://${BUCKET_NAME}"
+          
+          # Upload layer
+          aws s3 cp lambda-layer.zip "s3://${BUCKET_NAME}/lambda-layer-$(date +%s).zip"
+          echo "✅ Lambda layer uploaded to S3"
+
+      - name: Create Lambda Layer
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          BUCKET_NAME="discord-fleet-artifacts-${ACCOUNT_ID}"
+          LAYER_KEY=$(aws s3 ls "s3://${BUCKET_NAME}/" | grep lambda-layer | tail -1 | awk '{print $NF}')
+          
+          # Check if layer already exists
+          LAYER_ARN=$(aws lambda list-layer-versions --layer-name discord-fleet-dependencies --query 'LayerVersions[0].LayerVersionArn' --output text 2>/dev/null)
+          
+          if [ "$LAYER_ARN" == "None" ] || [ -z "$LAYER_ARN" ]; then
+            echo "Creating new Lambda layer..."
+            LAYER_ARN=$(aws lambda publish-layer-version \
+              --layer-name discord-fleet-dependencies \
+              --zip-file "fileb://lambda-layer.zip" \
+              --compatible-runtimes python3.11 \
+              --query 'LayerVersionArn' \
+              --output text)
+          fi
+          
+          echo "Layer ARN: ${LAYER_ARN}"
+          echo "LAYER_ARN=${LAYER_ARN}" >> $GITHUB_ENV
+
+      - name: Deploy DynamoDB Stack
+        run: |
+          echo "Deploying DynamoDB tables via CloudFormation..."
+          aws cloudformation deploy \
+            --template-file serverless/cloudformation/dynamodb-template.yaml \
+            --stack-name "${STACK_PREFIX}-dynamodb" \
+            --parameter-overrides EnvironmentName=prod \
+            --no-fail-on-empty-changeset \
+            --region ${{ env.AWS_DEFAULT_REGION }}
+          echo "✅ DynamoDB stack deployed"
+
+      - name: Get Lambda Execution Role ARN
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/lambda-execution-role"
+          
+          # Verify role exists
+          aws iam get-role --role-name lambda-execution-role
+          
+          echo "Lambda execution role found: ${ROLE_ARN}"
+          echo "LAMBDA_ROLE_ARN=${ROLE_ARN}" >> $GITHUB_ENV
+
+      - name: Deploy API Gateway Stack
+        run: |
+          echo "Deploying API Gateway and Lambda functions..."
+          aws cloudformation deploy \
+            --template-file serverless/cloudformation/api-gateway-template.yaml \
+            --stack-name "${STACK_PREFIX}-api" \
+            --parameter-overrides \
+              EnvironmentName=prod \
+              LambdaLayerArn="${LAYER_ARN}" \
+              LambdaExecutionRoleArn="${LAMBDA_ROLE_ARN}" \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset \
+            --region ${{ env.AWS_DEFAULT_REGION }}
+          echo "✅ API Gateway stack deployed"
+
+      - name: Get Webhook URL
+        run: |
+          WEBHOOK_URL=$(aws cloudformation describe-stacks \
+            --stack-name "${STACK_PREFIX}-api" \
+            --query 'Stacks[0].Outputs[?OutputKey==`WebhookUrl`].OutputValue' \
+            --output text \
+            --region ${{ env.AWS_DEFAULT_REGION }})
+          
+          echo "Webhook URL: ${WEBHOOK_URL}"
+          echo "WEBHOOK_URL=${WEBHOOK_URL}" >> $GITHUB_ENV
+
+      - name: Deployment Summary
+        run: |
+          echo "================================"
+          echo "✅ Infrastructure Deployed!"
+          echo "================================"
+          echo ""
+          echo "AWS Region: ${{ env.AWS_DEFAULT_REGION }}"
+          echo "Stack Prefix: ${STACK_PREFIX}"
+          echo ""
+          echo "Deployed Stacks:"
+          echo "  1. ${STACK_PREFIX}-dynamodb (DynamoDB tables)"
+          echo "  2. ${STACK_PREFIX}-api (API Gateway & Lambda)"
+          echo ""
+          echo "Lambda Layer: ${LAYER_ARN}"
+          echo ""
+          echo "🌐 Discord Webhook URL:"
+          echo "   ${WEBHOOK_URL}"
+          echo ""
+          echo "Next Steps:"
+          echo "1. Add webhook URL to Discord bot applications:"
+          echo "   - Guild Manager: Dev Portal → General Information → Interactions Endpoint URL"
+          echo "   - Bot User: Dev Portal → General Information → Interactions Endpoint URL"
+          echo "2. Test message routing"
+          echo "3. Verify Lambda logs in CloudWatch"
+
+  notify:
+    name: Notify Status
+    runs-on: ubuntu-latest
+    needs: deploy-infrastructure
+    if: always()
+    
+    steps:
+      - name: Report deployment status
+        run: |
+          if [ "${{ needs.deploy-infrastructure.result }}" == "success" ]; then
+            echo "✅ Infrastructure deployment completed successfully!"
+          else
+            echo "⚠️  Deployment encountered issues. Check logs above."
+          fi

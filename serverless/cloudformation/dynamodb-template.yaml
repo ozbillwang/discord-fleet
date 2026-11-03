@@ -1,0 +1,107 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Discord Fleet DynamoDB Tables'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: prod
+    Description: Environment name (prod, staging, dev)
+
+Resources:
+  # Sessions Table - stores conversation history
+  SessionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: discord-fleet-sessions
+      AttributeDefinitions:
+        - AttributeName: thread_id
+          AttributeType: S
+        - AttributeName: agent_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: thread_id
+          KeyType: HASH
+        - AttributeName: agent_id
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Application
+          Value: discord-fleet
+
+  # Bindings Table - maps Discord channels to AI agents
+  BindingsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: discord-fleet-bindings
+      AttributeDefinitions:
+        - AttributeName: channel_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: channel_id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Application
+          Value: discord-fleet
+
+  # Agents Table - stores agent configurations
+  AgentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: discord-fleet-agents
+      AttributeDefinitions:
+        - AttributeName: agent_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: agent_id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Application
+          Value: discord-fleet
+
+Outputs:
+  SessionsTableName:
+    Description: Sessions table name
+    Value: !Ref SessionsTable
+    Export:
+      Name: SessionsTableName
+
+  BindingsTableName:
+    Description: Bindings table name
+    Value: !Ref BindingsTable
+    Export:
+      Name: BindingsTableName
+
+  AgentsTableName:
+    Description: Agents table name
+    Value: !Ref AgentsTable
+    Export:
+      Name: AgentsTableName
+
+  SessionsTableArn:
+    Description: Sessions table ARN
+    Value: !GetAtt SessionsTable.Arn
+    Export:
+      Name: SessionsTableArn
+
+  BindingsTableArn:
+    Description: Bindings table ARN
+    Value: !GetAtt BindingsTable.Arn
+    Export:
+      Name: BindingsTableArn
+
+  AgentsTableArn:
+    Description: Agents table ARN
+    Value: !GetAtt AgentsTable.Arn
+    Export:
+      Name: AgentsTableArn

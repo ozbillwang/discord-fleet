@@ -1,0 +1,290 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Discord Fleet API Gateway and Lambda Integration'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: prod
+    Description: Environment name (prod, staging, dev)
+  
+  MessageHandlerFunctionName:
+    Type: String
+    Default: discord-fleet-message-handler
+    Description: Lambda function name for message handler
+  
+  OmpAgentHandlerFunctionName:
+    Type: String
+    Default: discord-fleet-omp-agent-handler
+    Description: Lambda function name for OMP agent handler
+  
+  LambdaLayerArn:
+    Type: String
+    Description: ARN of the Lambda layer with dependencies
+  
+  LambdaExecutionRoleArn:
+    Type: String
+    Description: ARN of the Lambda execution IAM role
+
+Resources:
+  # API Gateway
+  DiscordFleetApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: discord-fleet-webhook
+      Description: Discord interaction webhooks for Discord Fleet
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # Root resource /interactions
+  InteractionsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref DiscordFleetApi
+      ParentId: !GetAtt DiscordFleetApi.RootResourceId
+      PathPart: interactions
+
+  # POST method for /interactions
+  InteractionsPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref DiscordFleetApi
+      ResourceId: !Ref InteractionsResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt MessageHandlerFunction.Arn
+
+  # Lambda Permission for API Gateway to invoke
+  ApiGatewayLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MessageHandlerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DiscordFleetApi}/*
+
+  # Message Handler Lambda Function
+  MessageHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref MessageHandlerFunctionName
+      Runtime: python3.11
+      Role: !Ref LambdaExecutionRoleArn
+      Timeout: 60
+      MemorySize: 512
+      Layers:
+        - !Ref LambdaLayerArn
+      Environment:
+        Variables:
+          OMP_AGENT_HANDLER: !Ref OmpAgentHandlerFunctionName
+          BINDINGS_TABLE: discord-fleet-bindings
+          SESSIONS_TABLE: discord-fleet-sessions
+          AGENTS_TABLE: discord-fleet-agents
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          
+          dynamodb = boto3.resource('dynamodb')
+          lambda_client = boto3.client('lambda')
+          
+          def lambda_handler(event, context):
+              try:
+                  # Parse Discord interaction
+                  body = json.loads(event.get('body', '{}')) if isinstance(event.get('body'), str) else event.get('body', {})
+                  
+                  # Handle Discord URL verification (ping-pong)
+                  if body.get('type') == 1:
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({'type': 1})
+                      }
+                  
+                  channel_id = body.get('channel_id')
+                  message = body.get('data', {}).get('content', '')
+                  thread_id = body.get('channel_id')
+                  
+                  # Get channel binding from DynamoDB
+                  bindings_table = dynamodb.Table(os.environ.get('BINDINGS_TABLE', 'discord-fleet-bindings'))
+                  
+                  binding_response = bindings_table.get_item(Key={'channel_id': channel_id})
+                  
+                  if 'Item' not in binding_response:
+                      return {
+                          'statusCode': 404,
+                          'body': json.dumps({'error': 'Channel not bound'})
+                      }
+                  
+                  binding = binding_response['Item']
+                  agent_id = binding['agent_id']
+                  
+                  # Invoke omp_agent_handler
+                  response = lambda_client.invoke(
+                      FunctionName=os.environ.get('OMP_AGENT_HANDLER', 'discord-fleet-omp-agent-handler'),
+                      InvocationType='RequestResponse',
+                      Payload=json.dumps({
+                          'agent_id': agent_id,
+                          'message': message,
+                          'thread_id': thread_id,
+                          'channel_id': channel_id
+                      })
+                  )
+                  
+                  reply_payload = json.loads(response['Payload'].read())
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'reply': reply_payload.get('reply'),
+                          'agent_id': agent_id
+                      })
+                  }
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+
+  # OMP Agent Handler Lambda Function
+  OmpAgentHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref OmpAgentHandlerFunctionName
+      Runtime: python3.11
+      Role: !Ref LambdaExecutionRoleArn
+      Timeout: 30
+      MemorySize: 256
+      Layers:
+        - !Ref LambdaLayerArn
+      Environment:
+        Variables:
+          AGENTS_TABLE: discord-fleet-agents
+          SESSIONS_TABLE: discord-fleet-sessions
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import time
+          
+          dynamodb = boto3.resource('dynamodb')
+          
+          def lambda_handler(event, context):
+              try:
+                  agent_id = event.get('agent_id')
+                  message = event.get('message')
+                  thread_id = event.get('thread_id')
+                  
+                  # Get agent configuration
+                  agents_table = dynamodb.Table(os.environ.get('AGENTS_TABLE', 'discord-fleet-agents'))
+                  
+                  agent_response = agents_table.get_item(Key={'agent_id': agent_id})
+                  
+                  if 'Item' not in agent_response:
+                      return {'statusCode': 404, 'error': 'Agent not found'}
+                  
+                  agent_config = agent_response['Item']
+                  system_prompt = agent_config.get('system_prompt', '')
+                  
+                  # Get conversation history
+                  sessions_table = dynamodb.Table(os.environ.get('SESSIONS_TABLE', 'discord-fleet-sessions'))
+                  
+                  session_response = sessions_table.get_item(
+                      Key={'thread_id': thread_id, 'agent_id': agent_id}
+                  )
+                  
+                  messages = []
+                  if 'Item' in session_response:
+                      messages = session_response['Item'].get('messages', [])
+                  
+                  # For now, return a simple placeholder reply
+                  reply = f"Echo from {agent_id}: {message}"
+                  
+                  # Save to session history
+                  new_messages = messages + [
+                      {'role': 'user', 'content': message},
+                      {'role': 'assistant', 'content': reply}
+                  ]
+                  
+                  sessions_table.put_item(
+                      Item={
+                          'thread_id': thread_id,
+                          'agent_id': agent_id,
+                          'messages': new_messages,
+                          'updated_at': int(time.time())
+                      }
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'reply': reply,
+                      'agent_id': agent_id
+                  }
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  import traceback
+                  traceback.print_exc()
+                  return {
+                      'statusCode': 500,
+                      'error': str(e)
+                  }
+
+  # Lambda Permission for OMP Agent Handler
+  OmpAgentHandlerLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OmpAgentHandlerFunction
+      Action: lambda:InvokeFunction
+      Principal: lambda.amazonaws.com
+      SourceArn: !GetAtt MessageHandlerFunction.Arn
+
+  # API Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: InteractionsPostMethod
+    Properties:
+      RestApiId: !Ref DiscordFleetApi
+      StageName: !Ref EnvironmentName
+
+  # CloudWatch Log Group for API Gateway
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/apigateway/discord-fleet-${EnvironmentName}
+      RetentionInDays: 7
+
+Outputs:
+  ApiEndpoint:
+    Description: Discord interaction webhook endpoint URL
+    Value: !Sub https://${DiscordFleetApi}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}/interactions
+    Export:
+      Name: DiscordFleetWebhookUrl
+
+  ApiId:
+    Description: API Gateway ID
+    Value: !Ref DiscordFleetApi
+    Export:
+      Name: DiscordFleetApiId
+
+  MessageHandlerFunctionArn:
+    Description: ARN of message handler Lambda function
+    Value: !GetAtt MessageHandlerFunction.Arn
+    Export:
+      Name: MessageHandlerFunctionArn
+
+  OmpAgentHandlerFunctionArn:
+    Description: ARN of OMP agent handler Lambda function
+    Value: !GetAtt OmpAgentHandlerFunction.Arn
+    Export:
+      Name: OmpAgentHandlerFunctionArn
+
+  WebhookUrl:
+    Description: URL to use for Discord webhook configuration
+    Value: !Sub https://${DiscordFleetApi}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}/interactions
