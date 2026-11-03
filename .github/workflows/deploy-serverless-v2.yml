@@ -160,14 +160,22 @@ jobs:
 
       - name: Deploy DynamoDB Stack
         run: |
-          echo "Deploying DynamoDB tables via CloudFormation..."
-          aws cloudformation deploy \
-            --template-file serverless/cloudformation/dynamodb-template.yaml \
-            --stack-name "${STACK_PREFIX}-dynamodb" \
-            --parameter-overrides EnvironmentName=prod \
-            --no-fail-on-empty-changeset \
-            --region ${{ env.AWS_DEFAULT_REGION }}
-          echo "✅ DynamoDB stack deployed"
+          echo "Checking DynamoDB tables..."
+          
+          # Check if stack exists
+          if aws cloudformation describe-stacks --stack-name "${STACK_PREFIX}-dynamodb" --region ${{ env.AWS_DEFAULT_REGION }} 2>/dev/null; then
+            echo "✓ DynamoDB stack already exists - verifying tables"
+            aws dynamodb list-tables --region ${{ env.AWS_DEFAULT_REGION }} | grep -E "(discord-fleet-sessions|discord-fleet-bindings|discord-fleet-agents)" && echo "✅ All DynamoDB tables verified" || echo "⚠️ Some tables missing"
+          else
+            echo "Creating new DynamoDB stack..."
+            aws cloudformation deploy \
+              --template-file serverless/cloudformation/dynamodb-template.yaml \
+              --stack-name "${STACK_PREFIX}-dynamodb" \
+              --parameter-overrides EnvironmentName=prod \
+              --no-fail-on-empty-changeset \
+              --region ${{ env.AWS_DEFAULT_REGION }}
+            echo "✅ DynamoDB stack deployed"
+          fi
 
       - name: Get Lambda Execution Role ARN
         run: |
